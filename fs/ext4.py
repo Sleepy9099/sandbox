@@ -184,6 +184,74 @@ class Ext4FS(FSBase):
         else:
             raise CorruptFs(f"extent depth {eh_depth} unsupported")
 
+    def _read_u32_ptr_block(self, block_no: int) -> list[int]:
+        bs = self.sb.block_size
+        data = self.io.read(self._off(block_no * bs), bs)
+        return list(struct.unpack_from("<" + "I" * (bs // 4), data, 0))
+
+    def _legacy_logical_to_phys(self, inode: _Inode, lb: int) -> int | None:
+        """
+        Map logical block -> physical block for non-extents inodes.
+        Returns None for holes (0 pointers).
+        """
+        bs = self.sb.block_size
+        ptrs_per = bs // 4
+
+        # i_block holds 15 u32 pointers in legacy format
+        p = list(struct.unpack_from("<15I", inode.i_block, 0))
+        direct = p[0:12]
+        ind1, ind2, ind3 = p[12], p[13], p[14]
+
+        # direct
+        if lb < 12:
+            return direct[lb] or None
+        lb -= 12
+
+        # single indirect
+        if lb < ptrs_per:
+            if ind1 == 0:
+                return None
+            a = self._read_u32_ptr_block(ind1)
+            return a[lb] or None
+        lb -= ptrs_per
+
+        # double indirect
+        span2 = ptrs_per * ptrs_per
+        if lb < span2:
+            if ind2 == 0:
+                return None
+            l1 = self._read_u32_ptr_block(ind2)
+            i1 = lb // ptrs_per
+            i2 = lb % ptrs_per
+            blk1 = l1[i1]
+            if blk1 == 0:
+                return None
+            l2 = self._read_u32_ptr_block(blk1)
+            return l2[i2] or None
+        lb -= span2
+
+        # triple indirect (rare, but implement for completeness)
+        span3 = ptrs_per * ptrs_per * ptrs_per
+        if lb < span3:
+            if ind3 == 0:
+                return None
+            l1 = self._read_u32_ptr_block(ind3)
+            i1 = lb // span2
+            rem = lb % span2
+            i2 = rem // ptrs_per
+            i3 = rem % ptrs_per
+            blk1 = l1[i1]
+            if blk1 == 0:
+                return None
+            l2 = self._read_u32_ptr_block(blk1)
+            blk2 = l2[i2]
+            if blk2 == 0:
+                return None
+            l3 = self._read_u32_ptr_block(blk2)
+            return l3[i3] or None
+
+        return None
+
     def _read_file_bytes(self, inode: _Inode, offset: int, n: int) -> bytes:
         if not self._inode_is_reg(inode):
             raise IsADirectory("not a regular file")
@@ -266,27 +334,37 @@ class Ext4FS(FSBase):
         start_block = offset // bs
         end_block = (offset + n + bs - 1) // bs
 
-        extents = self._iter_extents(inode)
+        use_extents = bool(inode.flags & EXT4_EXTENTS_FL)
+
+        if use_extents:
+            extents = self._iter_extents(inode)
+
+            def map_lb(lb: int) -> int | None:
+                for l0, p0, ln in extents:
+                    if l0 <= lb < l0 + ln:
+                        return p0 + (lb - l0)
+                return None
+        else:
+            def map_lb(lb: int) -> int | None:
+                return self._legacy_logical_to_phys(inode, lb)
 
         out = bytearray()
         remaining = n
         cur_off = offset
         for lb in range(start_block, end_block):
-            phys = None
-            for l0, p0, ln in extents:
-                if l0 <= lb < l0 + ln:
-                    phys = p0 + (lb - l0)
-                    break
-            if phys is None:
-                # could be sparse; for now treat as corruption
-                raise CorruptFs("unmapped/sparse block not supported yet")
-
-            blk_off = self._off(phys * bs)
-            blk = self.io.read(blk_off, bs)
+            phys = map_lb(lb)
 
             inner = cur_off % bs
             take = min(bs - inner, remaining)
-            out += blk[inner:inner + take]
+
+            if phys is None:
+                # hole/unmapped => return zeros
+                out += b"\x00" * take
+            else:
+                blk_off = self._off(phys * bs)
+                blk = self.io.read(blk_off, bs)
+                out += blk[inner:inner + take]
+
             remaining -= take
             cur_off += take
             if remaining <= 0:
