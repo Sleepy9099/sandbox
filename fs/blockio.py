@@ -32,7 +32,15 @@ class BlockReader:
         if n <= self.cache_block:
             blk_off = (off // self.cache_block) * self.cache_block
             if blk_off != self._cache_off:
-                self._cache = self._read_exact(blk_off, self.cache_block)
+                # Clamp to available size so the last partial block at end-of-file
+                # doesn't raise BoundsError.  A partial cache is fine — the
+                # rel + n guard below will fall through to _read_exact for any
+                # request that lands outside what we actually loaded.
+                to_read = self.cache_block
+                if self.size is not None:
+                    to_read = min(to_read, self.size - blk_off)
+                self.f.seek(blk_off)
+                self._cache = self.f.read(to_read)  # partial read OK here
                 self._cache_off = blk_off
             rel = off - blk_off
             if rel + n <= len(self._cache):

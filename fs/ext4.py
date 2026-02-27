@@ -252,47 +252,6 @@ class Ext4FS(FSBase):
 
         return None
 
-    def _read_file_bytes(self, inode: _Inode, offset: int, n: int) -> bytes:
-        if not self._inode_is_reg(inode):
-            raise IsADirectory("not a regular file")
-        if offset < 0:
-            offset = 0
-        if offset >= inode.size:
-            return b""
-        n = min(n, inode.size - offset)
-
-        bs = self.sb.block_size
-        start_block = offset // bs
-        end_block = (offset + n + bs - 1) // bs
-
-        extents = self._iter_extents(inode)
-        # naive map: find extent for each logical block
-        out = bytearray()
-        remaining = n
-        cur_off = offset
-        for lb in range(start_block, end_block):
-            phys = None
-            run = None
-            for l0, p0, ln in extents:
-                if l0 <= lb < l0 + ln:
-                    phys = p0 + (lb - l0)
-                    run = ln - (lb - l0)
-                    break
-            if phys is None:
-                raise CorruptFs("sparse/unmapped block not supported yet")
-
-            blk_off = self._off(phys * bs)
-            blk = self.io.read(blk_off, bs)
-
-            inner = cur_off % bs
-            take = min(bs - inner, remaining)
-            out += blk[inner:inner + take]
-            remaining -= take
-            cur_off += take
-            if remaining <= 0:
-                break
-        return bytes(out)
-
     # -------- directories + path resolve --------
     def _read_dir(self, dir_ino: int) -> Dict[str, int]:
         if dir_ino in self._dir_cache:
@@ -306,7 +265,7 @@ class Ext4FS(FSBase):
         m: Dict[str, int] = {}
         pos = 0
         while pos + 8 <= len(data):
-            inode, rec_len, name_len, file_type = struct.unpack_from("<IHBb", data, pos)
+            inode, rec_len, name_len, file_type = struct.unpack_from("<IHBB", data, pos)
             if rec_len < 8 or pos + rec_len > len(data):
                 break
             name = data[pos + 8:pos + 8 + name_len].decode("utf-8", "replace")
@@ -371,8 +330,6 @@ class Ext4FS(FSBase):
                 break
 
         return bytes(out)
-
-    # REMOVE or stop using _read_file_bytes; everywhere it was used, switch to _read_inode_bytes
 
     def _read_file_bytes_as_dirblob(self, inode: _Inode) -> bytes:
         return self._read_inode_bytes(inode, 0, inode.size)
