@@ -8,7 +8,7 @@ from .ext4 import Ext4FS
 from .exfat import ExFatFS
 from .fat32 import Fat32FS
 
-FsType = Literal["ext4", "exfat", "auto"]
+FsType = Literal["ext4", "exfat", "fat32", "auto"]
 
 @dataclass(frozen=True)
 class MountInfo:
@@ -55,14 +55,8 @@ def mount(
         fs = Fat32FS(stream, base_offset=offset, total_size=size)
         return fs, MountInfo(fs_type="fat32", base_offset=offset)
 
-    # auto-probe: try ext4 then exfat (you can reverse if your data skews exfat)
+    # auto-probe: ext4 → exfat → fat32
     errors: list[Exception] = []
-    try:
-        fs = Ext4FS(stream, base_offset=offset, total_size=size)
-        return fs, MountInfo(fs_type="ext4", base_offset=offset)
-    except Exception as e:
-        errors.append(e)
-
     for t, cls in (("ext4", Ext4FS), ("exfat", ExFatFS), ("fat32", Fat32FS)):
         try:
             fs = cls(stream, base_offset=offset, total_size=size)

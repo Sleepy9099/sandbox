@@ -298,7 +298,6 @@ class Fat32FS(FSBase):
             def __init__(self) -> None:
                 self._pos = 0
                 self._closed = False
-                self._raw = None  # lazy cache
 
             def __enter__(self):
                 return self
@@ -307,25 +306,34 @@ class Fat32FS(FSBase):
                 self.close()
                 return False  # do not suppress exceptions
 
-
-            def _ensure(self) -> bytes:
-                if self._raw is None:
-                    # simplest/safest: read whole file; optimize later if needed
-                    self._raw = fs._read_clusters(chain, size=size)
-                return self._raw
-
             def read(self, n: int = -1) -> bytes:
                 if self._closed:
                     return b""
-                raw = self._ensure()
                 if self._pos >= size:
                     return b""
                 if n < 0:
                     n = size - self._pos
                 n = min(n, size - self._pos)
-                b = raw[self._pos:self._pos + n]
-                self._pos += len(b)
-                return b
+                if n == 0:
+                    return b""
+                # Stream directly from the cluster chain — never load the whole
+                # file into memory.  Each io.read is bounded to one cluster so
+                # the BlockReader cache remains effective.
+                out = bytearray()
+                remaining = n
+                cur = self._pos
+                cs = fs.cluster_size
+                while remaining > 0 and cur < size:
+                    ci = cur // cs
+                    inner = cur % cs
+                    if ci >= len(chain):
+                        break
+                    take = min(cs - inner, remaining)
+                    out += fs.io.read(fs._cluster_off(chain[ci]) + inner, take)
+                    remaining -= take
+                    cur += take
+                self._pos += len(out)
+                return bytes(out)
 
             def seek(self, off: int, whence: int = 0) -> int:
                 if whence == 0:
