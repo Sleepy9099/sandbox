@@ -1,6 +1,8 @@
 # fs/blockio.py
 from __future__ import annotations
+import io
 import mmap
+import os
 import struct
 from typing import BinaryIO
 
@@ -24,6 +26,7 @@ class BlockReader:
     def __init__(self, f: BinaryIO, size: int | None = None, cache_block: int = 1 << 20) -> None:
         self.size = size
         self._mm: mmap.mmap | None = None
+        self._fd: int | None = None   # kept for os.sendfile in copy_to()
         self._f: BinaryIO | None = None
         # Fallback cache state
         self._cache_off = -1
@@ -32,6 +35,7 @@ class BlockReader:
 
         try:
             fd = f.fileno()
+            self._fd = fd
             self._mm = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
             if size is None:
                 self.size = self._mm.size()
@@ -72,9 +76,47 @@ class BlockReader:
             raise BoundsError("short read")
         return data
 
+    def copy_to(self, out: BinaryIO, offset: int, size: int) -> int:
+        """Copy ``size`` bytes starting at ``offset`` from the image to *out*.
+
+        When both the source image and *out* are real files, ``os.sendfile``
+        is used for a kernel zero-copy transfer — no data passes through Python
+        memory at all.  This is the fast path for large-file extraction.
+
+        Falls back to chunked ``read`` + ``write`` for any stream that does not
+        have a file descriptor (e.g. BytesIO, sockets, pipes).
+
+        Returns the number of bytes written.
+        """
+        if size <= 0:
+            return 0
+        if self.size is not None and offset + size > self.size:
+            raise BoundsError("read beyond end")
+
+        # ── Zero-copy path via os.sendfile ───────────────────────────────────
+        if self._fd is not None and hasattr(os, "sendfile"):
+            try:
+                out_fd = out.fileno()
+                sent = 0
+                while sent < size:
+                    n = os.sendfile(out_fd, self._fd, offset + sent, size - sent)
+                    if n == 0:
+                        break
+                    sent += n
+                return sent
+            except (AttributeError, io.UnsupportedOperation, OSError):
+                pass  # dest has no real fd — fall through to chunked copy
+
+        # ── Chunked copy (mmap slice → write, or cached read → write) ────────
+        chunk = 1 << 20  # 1 MiB
+        sent = 0
+        while sent < size:
+            take = min(chunk, size - sent)
+            out.write(self.read(offset + sent, take))
+            sent += take
+        return sent
+
     # ── endian helpers ────────────────────────────────────────────────────────
-    # When mmap is active these call read() which returns a bytes slice;
-    # struct.unpack_from works on any buffer so there is no extra copy.
     def u8(self,   off: int) -> int: return self.read(off, 1)[0]
     def u16le(self, off: int) -> int: return struct.unpack_from("<H", self.read(off, 2))[0]
     def u32le(self, off: int) -> int: return struct.unpack_from("<I", self.read(off, 4))[0]

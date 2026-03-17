@@ -429,5 +429,49 @@ class Ext4FS(FSBase):
             def close(self) -> None:
                 self._closed = True
 
+            def extract_to(self, dest: BinaryIO) -> int:
+                """Extract the full file to *dest* without buffering in Python memory.
+
+                For extent-based inodes each extent is a contiguous run on disk,
+                so a single copy_to (and thus a single os.sendfile when dest is a
+                real file) is issued per extent.  Sparse holes are zero-filled.
+                Legacy (non-extent) inodes fall back to block-by-block copy_to.
+                """
+                bs = fs.sb.block_size
+                total = 0
+                remaining = ino.size
+                use_extents = bool(ino.flags & EXT4_EXTENTS_FL)
+                if use_extents:
+                    extents = sorted(fs._iter_extents(ino), key=lambda e: e[0])
+                    logical_pos = 0
+                    for l0, p0, ln in extents:
+                        hole_blocks = l0 - logical_pos
+                        if hole_blocks > 0:
+                            hole = min(hole_blocks * bs, remaining)
+                            dest.write(b"\x00" * hole)
+                            total += hole
+                            remaining -= hole
+                        if remaining <= 0:
+                            break
+                        run_bytes = min(ln * bs, remaining)
+                        n = fs.io.copy_to(dest, fs._off(p0 * bs), run_bytes)
+                        total += n
+                        remaining -= n
+                        logical_pos = l0 + ln
+                        if remaining <= 0:
+                            break
+                else:
+                    for lb in range((ino.size + bs - 1) // bs):
+                        if remaining <= 0:
+                            break
+                        phys = fs._legacy_logical_to_phys(ino, lb)
+                        take = min(bs, remaining)
+                        if phys is None:
+                            dest.write(b"\x00" * take)
+                            total += take
+                        else:
+                            total += fs.io.copy_to(dest, fs._off(phys * bs), take)
+                        remaining -= take
+                return total
 
         return _FH()

@@ -352,4 +352,27 @@ class Fat32FS(FSBase):
             def close(self) -> None:
                 self._closed = True
 
+            def extract_to(self, dest: BinaryIO) -> int:
+                """Extract the full file to *dest* without buffering in Python memory.
+
+                Consecutive clusters are coalesced into runs so that files stored
+                contiguously on disk are transferred with a single copy_to call
+                (and thus a single os.sendfile when dest is a real file).
+                """
+                if size == 0:
+                    return 0
+                cs = fs.cluster_size
+                total = 0
+                remaining = size
+                i = 0
+                while i < len(chain) and remaining > 0:
+                    j = i + 1
+                    while j < len(chain) and chain[j] == chain[j - 1] + 1:
+                        j += 1
+                    run_bytes = min((j - i) * cs, remaining)
+                    total += fs.io.copy_to(dest, fs._cluster_off(chain[i]), run_bytes)
+                    remaining -= run_bytes
+                    i = j
+                return total
+
         return _FH()
