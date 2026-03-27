@@ -1,7 +1,7 @@
 # fs/core.py
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import BinaryIO, Optional, Iterable, List, Protocol
+from typing import BinaryIO, Optional, Iterable, Iterator, List, Protocol, Tuple
 import time
 class FsError(Exception): ...
 class NotFound(FsError): ...
@@ -69,6 +69,35 @@ class FSBase:
             return True
         except NotFound:
             return False
+
+    def walk(
+        self,
+        top: str = "/",
+        topdown: bool = True,
+        onerror=None,
+    ) -> Iterator[Tuple[str, List[str], List[str]]]:
+        """Yield (dirpath, dirnames, filenames) triples, like os.walk."""
+        top = self._abspath(top)
+        try:
+            entries = self.ls(top)
+        except FsError as exc:
+            if onerror is not None:
+                onerror(exc)
+            return
+
+        dirnames = [e.name for e in entries if e.is_dir]
+        filenames = [e.name for e in entries if not e.is_dir]
+
+        if topdown:
+            yield top, dirnames, filenames
+            for name in dirnames:
+                child = top.rstrip("/") + "/" + name if top != "/" else "/" + name
+                yield from self.walk(child, topdown=topdown, onerror=onerror)
+        else:
+            for name in dirnames:
+                child = top.rstrip("/") + "/" + name if top != "/" else "/" + name
+                yield from self.walk(child, topdown=topdown, onerror=onerror)
+            yield top, dirnames, filenames
 
     # Helpers
     def _abspath(self, path: str) -> str:
