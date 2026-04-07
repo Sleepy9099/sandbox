@@ -4,11 +4,12 @@ from dataclasses import dataclass
 from typing import BinaryIO, Optional, Literal, Union
 
 from .core import FsError, CorruptFs
+from .emfat import EmFatFS
 from .ext4 import Ext4FS
 from .exfat import ExFatFS
 from .fat32 import Fat32FS
 
-FsType = Literal["ext4", "exfat", "fat32", "auto"]
+FsType = Literal["ext4", "exfat", "fat32", "emfat", "auto"]
 
 @dataclass(frozen=True)
 class MountInfo:
@@ -22,7 +23,7 @@ def mount(
     offset: int = 0,
     size: int | None = None,
     fs_type: FsType = "auto",
-) -> tuple[Union[Ext4FS, ExFatFS], MountInfo]:
+) -> tuple[Union[EmFatFS, Ext4FS, ExFatFS, Fat32FS], MountInfo]:
     """
     Mount a filesystem located at `offset` bytes within `stream`.
 
@@ -55,13 +56,17 @@ def mount(
         fs = Fat32FS(stream, base_offset=offset, total_size=size)
         return fs, MountInfo(fs_type="fat32", base_offset=offset)
 
-    # auto-probe: ext4 → exfat → fat32
+    if fs_type == "emfat":
+        fs = EmFatFS(stream, base_offset=offset, total_size=size)
+        return fs, MountInfo(fs_type="emfat", base_offset=offset)
+
+    # auto-probe: ext4 → exfat → fat32 → emfat
     errors: list[Exception] = []
-    for t, cls in (("ext4", Ext4FS), ("exfat", ExFatFS), ("fat32", Fat32FS)):
+    for t, cls in (("ext4", Ext4FS), ("exfat", ExFatFS), ("fat32", Fat32FS), ("emfat", EmFatFS)):
         try:
             fs = cls(stream, base_offset=offset, total_size=size)
             return fs, MountInfo(fs_type=t, base_offset=offset)
         except Exception as e:
             errors.append(e)
 
-    raise CorruptFs(f"auto-mount failed at offset 0x{offset:x} (ext4/exfat/fat32 probes failed)") from errors[-1]
+    raise CorruptFs(f"auto-mount failed at offset 0x{offset:x} (ext4/exfat/fat32/emfat probes failed)") from errors[-1]
