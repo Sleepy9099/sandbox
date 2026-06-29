@@ -90,7 +90,10 @@ _MIME = {
     "jpeg": "image/jpeg",
     "png": "image/png",
     "tiff": "image/tiff",
+    "dng": "image/x-adobe-dng",
     "mp4": "video/mp4",
+    "m4a": "audio/mp4",
+    "mov": "video/quicktime",
 }
 
 
@@ -127,6 +130,11 @@ _TAG_NAMES = {
     0x9204: "ExposureBiasValue", 0x9207: "MeteringMode", 0x9209: "Flash",
     0x920A: "FocalLength", 0xA002: "PixelXDimension", 0xA003: "PixelYDimension",
     0xA405: "FocalLengthIn35mmFilm", 0xA433: "LensMake", 0xA434: "LensModel",
+    # DNG (TIFF/EP-derived raw) tags
+    0xC612: "DNGVersion", 0xC613: "DNGBackwardVersion",
+    0xC614: "UniqueCameraModel", 0xC615: "LocalizedCameraModel",
+    0xC62F: "CameraSerialNumber", 0xC68B: "OriginalRawFileName",
+    0x014A: "SubIFDs",
 }
 
 _GPS_TAG_NAMES = {
@@ -327,6 +335,13 @@ def _parse_tiff_file(stream) -> Metadata:
     _finalize_exif(meta, _parse_tiff(stream.read()))
     meta.width = meta.tags.get("ImageWidth", meta.width)
     meta.height = meta.tags.get("ImageLength", meta.height)
+    # DNG is a TIFF profile -- the DNGVersion tag is its discriminator.
+    if "DNGVersion" in meta.tags:
+        ver = meta.tags["DNGVersion"]
+        if isinstance(ver, (list, tuple)):
+            meta.tags["DNGVersion"] = ".".join(str(int(x)) for x in ver)
+        meta.format = "dng"
+        meta.mime = _MIME["dng"]
     return meta
 
 
@@ -406,8 +421,22 @@ def _parse_mp4(stream) -> Metadata:
     _walk_boxes(stream, 0, size, meta, brands, depth=0)
     if brands:
         meta.extra["brands"] = brands
-        meta.mime = "video/quicktime" if brands[0] == "qt  " else meta.mime
+        fmt = _brand_to_format(brands[0])
+        meta.format = fmt
+        meta.mime = _MIME.get(fmt, meta.mime)
     return meta
+
+
+def _brand_to_format(brand: str) -> str:
+    b = brand.strip()
+    if b in ("M4A", "M4B", "M4P"):
+        return "m4a"
+    if b == "qt":
+        return "mov"
+    if b in ("M4V", "mp42", "mp41", "MSNV", "dash", "avc1", "iso2", "isom",
+             "mmp4", "3gp4", "3gp5"):
+        return "mp4"
+    return "mp4"
 
 
 def _walk_boxes(stream, start, end, meta, brands, depth):
@@ -446,9 +475,17 @@ def _walk_boxes(stream, start, end, meta, brands, depth):
         elif btype == b"\xa9xyz" or btype == b"xyz ":
             _read_iso6709(stream, body_off, body_len, meta)
         elif btype == b"meta":
-            # 'meta' has a 4-byte version/flags prefix before its children.
-            _walk_boxes(stream, body_off + 4, body_off + body_len, meta, brands,
+            # ISO 'meta' is a FullBox (4-byte version/flags before children);
+            # QuickTime 'meta' is not. Detect by peeking at the first child.
+            child_off = body_off
+            stream.seek(body_off + 4)
+            peek = stream.read(8)
+            if len(peek) == 8 and peek[4:8].isalpha():
+                child_off = body_off + 4
+            _walk_boxes(stream, child_off, body_off + body_len, meta, brands,
                         depth + 1)
+        elif btype == b"ilst":
+            _read_ilst(stream, body_off, body_len, meta)
         elif btype in _CONTAINER_BOXES:
             _walk_boxes(stream, body_off, body_off + body_len, meta, brands,
                         depth + 1)
@@ -504,6 +541,94 @@ def _read_iso6709(stream, off, length, meta) -> None:
         meta.gps["longitude"] = float(nums[1])
         if len(nums) >= 3:
             meta.gps["altitude"] = float(nums[2])
+
+
+# iTunes-style 'ilst' metadata atom keys (m4a / m4b / mp4).
+_ILST_KEYS = {
+    b"\xa9nam": "title", b"\xa9ART": "artist", b"aART": "album_artist",
+    b"\xa9alb": "album", b"\xa9day": "date", b"\xa9gen": "genre",
+    b"gnre": "genre", b"\xa9wrt": "composer", b"\xa9too": "encoder",
+    b"\xa9cmt": "comment", b"\xa9grp": "grouping", b"\xa9lyr": "lyrics",
+    b"cprt": "copyright", b"trkn": "track", b"disk": "disc",
+    b"tmpo": "bpm", b"covr": "cover_art",
+}
+
+# Genre indices stored by the legacy 'gnre' atom (1-based ID3v1 list).
+_ID3_GENRES = [
+    "Blues", "Classic Rock", "Country", "Dance", "Disco", "Funk", "Grunge",
+    "Hip-Hop", "Jazz", "Metal", "New Age", "Oldies", "Other", "Pop", "R&B",
+    "Rap", "Reggae", "Rock", "Techno", "Industrial", "Alternative", "Ska",
+    "Death Metal", "Pranks", "Soundtrack", "Euro-Techno", "Ambient",
+]
+
+
+def _read_ilst(stream, off, length, meta) -> None:
+    """Parse iTunes/MP4 metadata atoms (title, artist, album, ...)."""
+    end = off + length
+    pos = off
+    tags: Dict[str, Any] = {}
+    while pos + 8 <= end:
+        stream.seek(pos)
+        hdr = stream.read(8)
+        if len(hdr) < 8:
+            break
+        item_size, key = struct.unpack(">I4s", hdr)
+        if item_size < 8 or pos + item_size > end:
+            break
+        name = _ILST_KEYS.get(key)
+        if name is not None:
+            value = _read_ilst_data(stream, pos + 8, pos + item_size, key)
+            if value is not None:
+                tags[name] = value
+        pos += item_size
+    if tags:
+        meta.tags.update(tags)
+        meta.datetime = meta.datetime or tags.get("date")
+
+
+def _read_ilst_data(stream, start, end, key):
+    """Read the 'data' sub-atom of an ilst item and decode by type code."""
+    pos = start
+    while pos + 16 <= end:
+        stream.seek(pos)
+        hdr = stream.read(8)
+        if len(hdr) < 8:
+            return None
+        dsize, dtype = struct.unpack(">I4s", hdr)
+        if dsize < 16 or pos + dsize > end:
+            return None
+        if dtype != b"data":
+            pos += dsize
+            continue
+        meta4 = stream.read(8)            # 4-byte type indicator + 4-byte locale
+        type_ind = struct.unpack(">I", meta4[:4])[0] & 0x00FFFFFF
+        value = stream.read(pos + dsize - (pos + 16))
+        return _decode_ilst_value(key, type_ind, value)
+    return None
+
+
+def _decode_ilst_value(key, type_ind, value: bytes):
+    if key in (b"trkn", b"disk") and len(value) >= 6:
+        num = struct.unpack_from(">H", value, 2)[0]
+        total = struct.unpack_from(">H", value, 4)[0]
+        return f"{num}/{total}" if total else str(num)
+    if key == b"gnre" and len(value) >= 2:
+        idx = struct.unpack(">H", value[:2])[0] - 1
+        return _ID3_GENRES[idx] if 0 <= idx < len(_ID3_GENRES) else idx
+    if key == b"covr":
+        codec = "jpeg" if value[:3] == b"\xff\xd8\xff" else (
+            "png" if value[:8] == b"\x89PNG\r\n\x1a\n" else "unknown")
+        return {"codec": codec, "bytes": len(value)}
+    if type_ind == 1:                     # UTF-8 text
+        return value.decode("utf-8", "replace")
+    if type_ind == 2:                     # UTF-16BE text
+        return value.decode("utf-16-be", "replace")
+    if type_ind in (21, 22) and value:    # signed / unsigned big-endian int
+        return int.from_bytes(value, "big", signed=(type_ind == 21))
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError:
+        return value
 
 
 # --------------------------------------------------------------------------- #

@@ -17,7 +17,7 @@ never closed by the module, so you keep ownership of your `fs` handle.)
 
 | Module | What it does | Offline strategy | Optional accelerators |
 |--------|--------------|------------------|-----------------------|
-| `tools.exif`    | EXIF / metadata + GPS from JPEG, PNG, MP4/MOV, TIFF | pure-Python parsers, no assets | — |
+| `tools.exif`    | EXIF / metadata + GPS from JPEG, PNG, TIFF, DNG, MP4/MOV/M4A | pure-Python parsers, no assets | — |
 | `tools.geocode` | nearest city + state from lat/lon | bundled GeoNames `cities1000` CSV | `numpy` (vectorised query) |
 | `tools.rosbag`  | extract embedded compressed JPEGs from ROS 1 `.bag` | native ROS1 v2.0 + `bz2` reader | `lz4` (lz4 chunks), `numpy`+`cv2` (transcode raw `Image`) |
 | `tools.geoid`   | HAE → MSL height via EGM96 geoid | bundled `egm96-5` grid + bilinear interp | — |
@@ -46,6 +46,16 @@ with open("drive.bag", "rb") as fh:
     for name, jpeg in extract_jpegs(fh):
         open(name, "wb").write(jpeg)
 ```
+
+### `tools.exif` formats
+
+- **JPEG** — Exif (APP1/TIFF) tags, GPS, dimensions, XMP blob.
+- **TIFF / DNG** — shared IFD parser; DNG (TIFF-based raw) is reported as
+  `format="dng"` and exposes `DNGVersion` plus camera Make/Model and GPS.
+- **PNG** — `IHDR` geometry, `tEXt`/`zTXt`/`iTXt` text, `tIME`, embedded `eXIf`.
+- **MP4 / MOV / M4A** — ISO-BMFF boxes: `ftyp` brand → format/mime
+  (`m4a` ⇒ `audio/mp4`), `mvhd` creation time + duration, `udta` ISO-6709 GPS,
+  and iTunes `ilst` tags (title, artist, album, track, genre, bpm, …).
 
 ## Bundled assets (`tools/_assets/`)
 

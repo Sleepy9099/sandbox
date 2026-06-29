@@ -100,8 +100,75 @@ def _build_png(tiff: bytes) -> bytes:
             + _png_chunk(b"eXIf", tiff) + _png_chunk(b"IEND", b""))
 
 
+def _build_dng() -> bytes:
+    """A minimal DNG: TIFF carrying the DNGVersion tag plus Make/Model/GPS."""
+    ifd0_off = 8
+    ifd0_size = 2 + 12 * 7 + 4
+    exif_off = ifd0_off + ifd0_size
+    exif_size = 2 + 12 * 1 + 4
+    gps_off = exif_off + exif_size
+    gps_size = 2 + 12 * 4 + 4
+    pool_base = gps_off + gps_size
+    pool = bytearray()
+
+    def ascii_entry(tag, s):
+        raw = s.encode() + b"\x00"
+        if len(raw) <= 4:
+            return struct.pack("<HHI4s", tag, 2, len(raw), raw + b"\x00" * (4 - len(raw)))
+        off = pool_base + len(pool)
+        pool.extend(raw + (b"\x00" if len(raw) % 2 else b""))
+        return struct.pack("<HHII", tag, 2, len(raw), off)
+
+    def rational_entry(tag, pairs):
+        off = pool_base + len(pool)
+        for num, den in pairs:
+            pool.extend(struct.pack("<II", num, den))
+        return struct.pack("<HHII", tag, 5, len(pairs), off)
+
+    ifd0 = struct.pack("<H", 7)
+    ifd0 += struct.pack("<HHII", 0x0100, 4, 1, 6000)
+    ifd0 += struct.pack("<HHII", 0x0101, 4, 1, 4000)
+    ifd0 += ascii_entry(0x010F, "DJI")
+    ifd0 += ascii_entry(0x0110, "FC7203")
+    ifd0 += struct.pack("<HHI4s", 0xC612, 1, 4, bytes([1, 4, 0, 0]))  # DNGVersion
+    ifd0 += struct.pack("<HHII", 0x8769, 4, 1, exif_off)
+    ifd0 += struct.pack("<HHII", 0x8825, 4, 1, gps_off)
+    ifd0 += struct.pack("<I", 0)
+    exif = struct.pack("<H", 1) + ascii_entry(0x9003, "2026:06:29 11:59:30") + struct.pack("<I", 0)
+    gps = struct.pack("<H", 4)
+    gps += ascii_entry(0x0001, "N") + rational_entry(0x0002, [(37, 1), (46, 1), (2964, 100)])
+    gps += ascii_entry(0x0003, "W") + rational_entry(0x0004, [(122, 1), (25, 1), (990, 100)])
+    gps += struct.pack("<I", 0)
+    return b"II" + struct.pack("<HI", 42, ifd0_off) + ifd0 + exif + gps + bytes(pool)
+
+
 def _box(btype: bytes, payload: bytes) -> bytes:
     return struct.pack(">I", len(payload) + 8) + btype + payload
+
+
+def _build_m4a() -> bytes:
+    """An ISO-BMFF audio file with an iTunes-style ilst metadata atom."""
+    def data_atom(type_ind, value):
+        return _box(b"data", struct.pack(">II", type_ind, 0) + value)
+
+    ftyp = _box(b"ftyp", b"M4A " + struct.pack(">I", 0) + b"M4A mp42isom")
+    secs = int(datetime.datetime(2026, 6, 29, 12, 0, 0,
+                                 tzinfo=datetime.timezone.utc).timestamp()) + 2082844800
+    mvhd = _box(b"mvhd", b"\x00\x00\x00\x00"
+                + struct.pack(">IIII", secs, secs, 44100, 44100 * 180) + b"\x00" * 80)
+    ilst = b"".join([
+        _box(b"\xa9nam", data_atom(1, b"My Song")),
+        _box(b"\xa9ART", data_atom(1, b"The Artist")),
+        _box(b"\xa9alb", data_atom(1, b"Greatest Hits")),
+        _box(b"\xa9day", data_atom(1, b"2026")),
+        _box(b"trkn", data_atom(0, b"\x00\x00\x00\x03\x00\x0a\x00\x00")),
+        _box(b"gnre", data_atom(0, b"\x00\x12")),       # 18 -> 'Rock'
+        _box(b"tmpo", data_atom(21, b"\x00\x78")),      # 120 bpm
+    ])
+    hdlr = _box(b"hdlr", b"\x00" * 8 + b"mdirappl" + b"\x00" * 9)
+    meta = _box(b"meta", b"\x00\x00\x00\x00" + hdlr + _box(b"ilst", ilst))
+    moov = _box(b"moov", mvhd + _box(b"udta", meta))
+    return ftyp + moov
 
 
 def _build_mp4() -> bytes:
@@ -169,7 +236,20 @@ def test_exif():
         assert meta.format == fmt, (fmt, meta.format)
         assert abs(meta.gps["latitude"] - 37.7749) < 1e-3, meta.gps
         assert abs(meta.gps["longitude"] - (-122.4194)) < 1e-3, meta.gps
-    print("exif      : jpeg/png/tiff/mp4 parsed, GPS decoded  OK")
+
+    # DNG (TIFF-based raw) is recognised distinctly and keeps GPS/camera tags.
+    dng = exif.read_metadata(io.BytesIO(_build_dng()))
+    assert dng.format == "dng" and dng.tags["DNGVersion"] == "1.4.0.0", dng.tags
+    assert dng.tags["Model"] == "FC7203"
+    assert abs(dng.gps["latitude"] - 37.7749) < 1e-3, dng.gps
+
+    # m4a audio: iTunes metadata atoms decode to friendly tags.
+    m4a = exif.read_metadata(io.BytesIO(_build_m4a()))
+    assert m4a.format == "m4a" and m4a.mime == "audio/mp4", (m4a.format, m4a.mime)
+    assert m4a.tags["title"] == "My Song" and m4a.tags["artist"] == "The Artist"
+    assert m4a.tags["track"] == "3/10" and m4a.tags["genre"] == "Rock"
+    assert m4a.tags["bpm"] == 120 and m4a.extra["duration_seconds"] == 180.0
+    print("exif      : jpeg/png/tiff/dng/mp4/m4a parsed, GPS + tags decoded  OK")
 
 
 def test_geocode():
